@@ -39,6 +39,7 @@ class SimulationParameters : public SimulationParametersBase
         pp.load("puncture_tracking_level", puncture_tracking_level, max_level);
         pp.load("calculate_constraint_norms", calculate_constraint_norms,
                 false);
+        pp.load("constraint_mask_chi_min", constraint_mask_chi_min, 0.1);
 
 #ifdef USE_AHFINDER
         pp.load("AH_1_initial_guess", AH_1_initial_guess,
@@ -302,10 +303,14 @@ class SimulationParameters : public SimulationParametersBase
                         (puncture_tracking_level >= 0) &&
                             (puncture_tracking_level <= max_level),
                         "must be between 0 and max_level (inclusive)");
+        check_parameter("constraint_mask_chi_min", constraint_mask_chi_min,
+                        true,
+                        "is the chi threshold used for masked constraint norms");
     }
 
     bool track_punctures, calculate_constraint_norms;
     int puncture_tracking_level;
+    double constraint_mask_chi_min;
 
     // Collection of parameters necessary for initial conditions
     // Set these even in the case of TwoPunctures as they are used elsewhere

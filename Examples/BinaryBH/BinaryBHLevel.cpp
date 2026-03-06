@@ -6,6 +6,7 @@
 #include "BinaryBHLevel.hpp"
 #include "AMRReductions.hpp"
 #include "BinaryBH.hpp"
+#include "BoxIterator.H"
 #include "BoxLoops.hpp"
 #include "CCZ4RHS.hpp"
 #include "ChiExtractionTaggingCriterion.hpp"
@@ -22,6 +23,123 @@
 #include "TwoPuncturesInitialData.hpp"
 #include "Weyl4.hpp"
 #include "WeylExtraction.hpp"
+
+#include <cmath>
+#include <limits>
+#include <vector>
+
+namespace
+{
+struct MaskedConstraintNorms
+{
+    double L2_Ham = std::numeric_limits<double>::quiet_NaN();
+    double L2_Mom = std::numeric_limits<double>::quiet_NaN();
+    double L1_Ham = std::numeric_limits<double>::quiet_NaN();
+    double L1_Mom = std::numeric_limits<double>::quiet_NaN();
+};
+
+enum MaskedReductionVars
+{
+    c_mask = 0,
+    c_Ham_masked,
+    c_Mom1_masked,
+    c_Mom2_masked,
+    c_Mom3_masked,
+    NUM_MASK_REDUCTION_VARS
+};
+
+MaskedConstraintNorms compute_masked_constraint_norms(const GRAMR &a_gr_amr,
+                                                      const double a_chi_min)
+{
+    MaskedConstraintNorms out;
+
+    const auto gramrlevel_ptrs = a_gr_amr.get_gramrlevels();
+    const int num_levels = gramrlevel_ptrs.size();
+    if (num_levels == 0)
+    {
+        return out;
+    }
+
+    std::vector<GRLevelData> masked_level_data(num_levels);
+    Vector<LevelData<FArrayBox> *> masked_level_data_ptrs(num_levels);
+    Vector<int> ref_ratios(num_levels);
+
+    for (int ilev = 0; ilev < num_levels; ++ilev)
+    {
+        const auto *level_ptr = gramrlevel_ptrs[ilev];
+        const auto &evolution_data =
+            level_ptr->getLevelData(VariableType::evolution);
+        const auto &diagnostic_data =
+            level_ptr->getLevelData(VariableType::diagnostic);
+        const auto &level_layout = diagnostic_data.disjointBoxLayout();
+
+        masked_level_data[ilev].define(level_layout, NUM_MASK_REDUCTION_VARS,
+                                       IntVect::Zero);
+        masked_level_data[ilev].setVal(0.0);
+        masked_level_data_ptrs[ilev] = &masked_level_data[ilev];
+        ref_ratios[ilev] = level_ptr->refRatio();
+
+        DataIterator dit = level_layout.dataIterator();
+        for (dit.begin(); dit.ok(); ++dit)
+        {
+            FArrayBox &masked_fab = masked_level_data[ilev][dit];
+            const FArrayBox &evolution_fab = evolution_data[dit];
+            const FArrayBox &diagnostic_fab = diagnostic_data[dit];
+            const Box loop_box = level_layout[dit];
+
+            for (BoxIterator bit(loop_box); bit.ok(); ++bit)
+            {
+                const IntVect iv = bit();
+                const double chi = evolution_fab(iv, c_chi);
+
+                if (chi > a_chi_min)
+                {
+                    masked_fab(iv, c_mask) = 1.0;
+                    masked_fab(iv, c_Ham_masked) = diagnostic_fab(iv, c_Ham);
+                    masked_fab(iv, c_Mom1_masked) = diagnostic_fab(iv, c_Mom1);
+                    masked_fab(iv, c_Mom2_masked) = diagnostic_fab(iv, c_Mom2);
+                    masked_fab(iv, c_Mom3_masked) = diagnostic_fab(iv, c_Mom3);
+                }
+            }
+        }
+    }
+
+    const int base_level = 0;
+    const double coarsest_dx = gramrlevel_ptrs[0]->get_dx();
+
+    // This is the AMR-aware physical volume of the region satisfying chi > a_chi_min.
+    const double masked_volume =
+        computeSum(masked_level_data_ptrs, ref_ratios, coarsest_dx,
+                   Interval(c_mask, c_mask), base_level);
+
+    if (masked_volume <= 0.0)
+    {
+        return out;
+    }
+
+    // L1 = mean absolute value over the masked region.
+    out.L1_Ham =
+        computeNorm(masked_level_data_ptrs, ref_ratios, coarsest_dx,
+                    Interval(c_Ham_masked, c_Ham_masked), 1, base_level) /
+        masked_volume;
+    out.L1_Mom =
+        computeNorm(masked_level_data_ptrs, ref_ratios, coarsest_dx,
+                    Interval(c_Mom1_masked, c_Mom3_masked), 1, base_level) /
+        masked_volume;
+
+    // L2 = sqrt( integral |f|^2 dV / integral 1 dV ) over the masked region.
+    out.L2_Ham =
+        computeNorm(masked_level_data_ptrs, ref_ratios, coarsest_dx,
+                    Interval(c_Ham_masked, c_Ham_masked), 2, base_level) /
+        std::sqrt(masked_volume);
+    out.L2_Mom =
+        computeNorm(masked_level_data_ptrs, ref_ratios, coarsest_dx,
+                    Interval(c_Mom1_masked, c_Mom3_masked), 2, base_level) /
+        std::sqrt(masked_volume);
+
+    return out;
+}
+} // namespace
 
 // Things to do during the advance step after RK4 steps
 void BinaryBHLevel::specificAdvance()
@@ -180,11 +298,9 @@ void BinaryBHLevel::specificPostTimeStep()
         {
             AMRReductions<VariableType::diagnostic> amr_reductions(m_gr_amr);
 
-            // L2 norms
+            // Unmasked norms over the full AMR hierarchy.
             double L2_Ham = amr_reductions.norm(c_Ham, 2);
             double L2_Mom = amr_reductions.norm(Interval(c_Mom1, c_Mom3), 2);
-
-            // L1 norms = mean absolute value
             double L1_Ham = amr_reductions.norm(c_Ham, 1);
             double L1_Mom = amr_reductions.norm(Interval(c_Mom1, c_Mom3), 1);
 
@@ -192,15 +308,32 @@ void BinaryBHLevel::specificPostTimeStep()
                                          m_dt, m_time, m_restart_time,
                                          SmallDataIO::APPEND, first_step);
             constraints_file.remove_duplicate_time_data();
-
             if (first_step)
             {
                 constraints_file.write_header_line(
                     {"L^2_Ham", "L^2_Mom", "L^1_Ham", "L^1_Mom"});
             }
-
             constraints_file.write_time_data_line(
                 {L2_Ham, L2_Mom, L1_Ham, L1_Mom});
+
+            // Masked norms restricted to the region chi > constraint_mask_chi_min.
+            const double chi_mask_threshold = m_p.constraint_mask_chi_min;
+            const auto masked_norms =
+                compute_masked_constraint_norms(m_gr_amr, chi_mask_threshold);
+
+            SmallDataIO masked_constraints_file(
+                m_p.data_path + "constraint_norms_mask", m_dt, m_time,
+                m_restart_time, SmallDataIO::APPEND, first_step);
+            masked_constraints_file.remove_duplicate_time_data();
+            if (first_step)
+            {
+                masked_constraints_file.write_header_line(
+                    {"L^2_Ham_mask", "L^2_Mom_mask",
+                     "L^1_Ham_mask", "L^1_Mom_mask"});
+            }
+            masked_constraints_file.write_time_data_line(
+                {masked_norms.L2_Ham, masked_norms.L2_Mom,
+                 masked_norms.L1_Ham, masked_norms.L1_Mom});
         }
     }
 

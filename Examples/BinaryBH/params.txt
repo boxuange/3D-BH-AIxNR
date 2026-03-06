@@ -226,5 +226,5 @@ AH_set_origins_to_punctures = 1
 
 #################################################
 
-
+constraint_mask_chi_min = 0.3
 
